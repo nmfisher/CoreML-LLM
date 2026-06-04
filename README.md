@@ -52,6 +52,20 @@ All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fall
 - Tool / function calling → **FunctionGemma-270M**
 - Sentence embeddings / RAG → **EmbeddingGemma-300M**
 
+## Burst tok/s is only half the story
+
+The decode numbers above are **cold-burst** speed. Run the same model *continuously* and the ranking inverts: the GPU runtimes (MLX, LiteRT-LM) thermally throttle **50%+ within ~60 s**, while CoreML on the ANE barely moves — it draws **~half the power** (12.7 W vs ~24.7 W at full decode, measured on Mac), so the phone doesn't have to throttle it. Under sustained load the ANE overtakes MLX outright.
+
+![Sustained decode throttling — iPhone 17 Pro, Gemma 4 E2B 4-bit](https://raw.githubusercontent.com/john-rocky/apple-silicon-llm-bench/main/results/iphone17pro-throttle.png)
+
+| Runtime (compute) | Burst tok/s | Sustained (10 min) | Retained |
+|---|--:|--:|--:|
+| **CoreML / ANE** | 33 | **22** | **67%** |
+| MLX / GPU | 48 | 18 | 38% |
+| LiteRT-LM / GPU | 56 | 27 | 48% |
+
+Lower peak, but it sustains — and leaves the GPU free for the rest of the app. Full data + repro: [apple-silicon-llm-bench](https://github.com/john-rocky/apple-silicon-llm-bench).
+
 ## Demos
 
 <table>
