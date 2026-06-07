@@ -36,6 +36,12 @@ public final class Qwen3VL2BStatefulGenerator {
         let layersPerChunk: Int
         let ropeTheta: Float
         let computeUnits: MLComputeUnits
+        // Chunk folder name (e.g. "qwen3_vl_2b_stateful_chunks") and the
+        // default Documents/Models/<dir> sideload location. These make
+        // the generator size-agnostic: the 8B reuses every prefill /
+        // decode / resume path with only the layout strings + dims swapped.
+        let chunkSubdir: String
+        let modelDirName: String
 
         public static let defaultFourChunk = Config(
             maxSeq: 2048, vocab: 151936,
@@ -43,7 +49,9 @@ public final class Qwen3VL2BStatefulGenerator {
             numKVHeads: 8, headDim: 128,
             numBodyChunks: 4, layersPerChunk: 7,
             ropeTheta: 5_000_000,
-            computeUnits: .cpuAndNeuralEngine)
+            computeUnits: .cpuAndNeuralEngine,
+            chunkSubdir: "qwen3_vl_2b_stateful_chunks",
+            modelDirName: "qwen3-vl-2b-stateful")
 
         public static let defaultTwoChunk = Config(
             maxSeq: 2048, vocab: 151936,
@@ -51,7 +59,35 @@ public final class Qwen3VL2BStatefulGenerator {
             numKVHeads: 8, headDim: 128,
             numBodyChunks: 2, layersPerChunk: 14,
             ropeTheta: 5_000_000,
-            computeUnits: .cpuAndNeuralEngine)
+            computeUnits: .cpuAndNeuralEngine,
+            chunkSubdir: "qwen3_vl_2b_stateful_chunks",
+            modelDirName: "qwen3-vl-2b-stateful")
+
+        // Qwen3-VL 8B text-only: 36 layers / 6 chunks, hidden 4096,
+        // untied head. Same MLState chunk I/O as 2B, so this class drives
+        // it unchanged. Matches build_qwen3_vl_8b_stateful_chunks.py.
+        public static let default8B = Config(
+            maxSeq: 2048, vocab: 151936,
+            hiddenSize: 4096, numLayers: 36,
+            numKVHeads: 8, headDim: 128,
+            numBodyChunks: 6, layersPerChunk: 6,
+            ropeTheta: 5_000_000,
+            computeUnits: .cpuAndNeuralEngine,
+            chunkSubdir: "qwen3_vl_8b_stateful_chunks",
+            modelDirName: "qwen3-vl-8b-stateful")
+
+        // Qwen3-VL 4B text-only: 36 layers / 6 chunks, hidden 2560,
+        // TIED head. Same MLState chunk I/O as 2B/8B. Matches
+        // build_qwen3_vl_4b_stateful_chunks.py.
+        public static let default4B = Config(
+            maxSeq: 2048, vocab: 151936,
+            hiddenSize: 2560, numLayers: 36,
+            numKVHeads: 8, headDim: 128,
+            numBodyChunks: 6, layersPerChunk: 6,
+            ropeTheta: 5_000_000,
+            computeUnits: .cpuAndNeuralEngine,
+            chunkSubdir: "qwen3_vl_4b_stateful_chunks",
+            modelDirName: "qwen3-vl-4b-stateful")
     }
 
     public var status = "Idle"
@@ -336,7 +372,7 @@ public final class Qwen3VL2BStatefulGenerator {
     private func resolveURLs()
         -> (body: [URL], head: URL, embed: URL, chunk0Vision: URL?)?
     {
-        let subdir = "qwen3_vl_2b_stateful_chunks"
+        let subdir = cfg.chunkSubdir
         let fm = FileManager.default
 
         func resolveOne(_ dir: URL, _ base: String) -> URL? {
@@ -371,7 +407,7 @@ public final class Qwen3VL2BStatefulGenerator {
            let r = resolve(docs) { return r }
         let defaultFolder = try? fm.url(for: .documentDirectory, in: .userDomainMask,
                                          appropriateFor: nil, create: false)
-        return defaultFolder.flatMap { resolve($0.appendingPathComponent("Models/qwen3-vl-2b-stateful")) }
+        return defaultFolder.flatMap { resolve($0.appendingPathComponent("Models/\(cfg.modelDirName)")) }
     }
 
     // MARK: - Compute plan audit

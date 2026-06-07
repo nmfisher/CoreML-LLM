@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Compile + sideload the Qwen3-VL 4B stateful chunks to the connected
+# iPhone. Fork of scripts/qwen3vl_stateful_push.sh (text-only: 6 chunks
+# + head + embed sidecar, no vision tower).
+#
+# Builds .mlmodelc from each .mlpackage under --src, copies to
+# Documents/Models/qwen3-vl-4b-stateful/qwen3_vl_4b_stateful_chunks/
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC_DIR="${1:-/tmp/qwen3vl4b_stateful/qwen3_vl_4b_stateful_chunks}"
+BUNDLE_ID="com.example.CoreMLLLMChat"
+REMOTE_DIR="Documents/Models/qwen3-vl-4b-stateful/qwen3_vl_4b_stateful_chunks"
+
+if [ ! -d "$SRC_DIR" ]; then
+    echo "source dir not found: $SRC_DIR" >&2
+    echo "expected layout: $SRC_DIR/{chunk_0..5.mlpackage, chunk_head.mlpackage, embed_weight.bin}" >&2
+    exit 1
+fi
+
+DEVICE=$(xcrun devicectl list devices | awk '/connected/{print $3}' | head -1)
+if [ -z "$DEVICE" ]; then
+    echo "no connected iOS device" >&2
+    exit 1
+fi
+echo "target device $DEVICE"
+echo "target bundle $BUNDLE_ID → $REMOTE_DIR"
+
+COMPILE_DIR="$SRC_DIR/_mlmodelc"
+mkdir -p "$COMPILE_DIR"
+
+for pkg in "$SRC_DIR"/*.mlpackage; do
+    name=$(basename "$pkg" .mlpackage)
+    mlc="$COMPILE_DIR/$name.mlmodelc"
+    if [ ! -d "$mlc" ] || [ "$pkg" -nt "$mlc" ]; then
+        echo "compiling $name.mlpackage..."
+        xcrun coremlcompiler compile "$pkg" "$COMPILE_DIR" >/dev/null
+    fi
+    size=$(du -sh "$mlc" | awk '{print $1}')
+    echo "  push $name.mlmodelc ($size)..."
+    xcrun devicectl device copy to \
+        --device "$DEVICE" \
+        --domain-type appDataContainer \
+        --domain-identifier "$BUNDLE_ID" \
+        --source "$mlc" \
+        --destination "$REMOTE_DIR/$name.mlmodelc" > /dev/null
+done
+
+EMBED_BIN="$SRC_DIR/embed_weight.bin"
+if [ -f "$EMBED_BIN" ]; then
+    size=$(du -sh "$EMBED_BIN" | awk '{print $1}')
+    echo "  push embed_weight.bin ($size)..."
+    xcrun devicectl device copy to \
+        --device "$DEVICE" \
+        --domain-type appDataContainer \
+        --domain-identifier "$BUNDLE_ID" \
+        --source "$EMBED_BIN" \
+        --destination "$REMOTE_DIR/embed_weight.bin" > /dev/null
+fi
+
+# Optional vision encoder: <SRC_DIR>/../qwen3_vl_4b_vision/vision.mlpackage
+# (output of build_qwen3_vl_4b_vision.py). chunk_0_vision.mlpackage lives
+# inside SRC_DIR and is already pushed by the *.mlpackage loop above.
+VISION_DIR="$(dirname "$SRC_DIR")/qwen3_vl_4b_vision"
+VISION_REMOTE="Documents/Models/qwen3-vl-4b-stateful/qwen3_vl_4b_vision"
+if [ -d "$VISION_DIR/vision.mlpackage" ]; then
+    VISION_MLC="$VISION_DIR/_mlmodelc"
+    mkdir -p "$VISION_MLC"
+    if [ ! -d "$VISION_MLC/vision.mlmodelc" ] \
+        || [ "$VISION_DIR/vision.mlpackage" -nt "$VISION_MLC/vision.mlmodelc" ]; then
+        echo "compiling vision.mlpackage..."
+        xcrun coremlcompiler compile "$VISION_DIR/vision.mlpackage" "$VISION_MLC" >/dev/null
+    fi
+    if [ -d "$VISION_MLC/vision.mlmodelc" ]; then
+        size=$(du -sh "$VISION_MLC/vision.mlmodelc" | awk '{print $1}')
+        echo "  push vision.mlmodelc ($size)..."
+        xcrun devicectl device copy to \
+            --device "$DEVICE" \
+            --domain-type appDataContainer \
+            --domain-identifier "$BUNDLE_ID" \
+            --source "$VISION_MLC/vision.mlmodelc" \
+            --destination "$VISION_REMOTE/vision.mlmodelc" > /dev/null
+    fi
+fi
+
+echo ""
+echo "verifying layout on device..."
+xcrun devicectl device info files \
+    --device "$DEVICE" \
+    --domain-type appDataContainer \
+    --domain-identifier "$BUNDLE_ID" \
+    --subdirectory "$REMOTE_DIR" 2>&1 | grep -E "chunk_|embed_weight" | head -30
+
+echo ""
+echo "done. In Xcode: rebuild+run CoreMLLLMChat → Models tab →"
+echo "  'Qwen3-VL 4B — text-only' → 'Stateful 64-token smoke test' → Run."

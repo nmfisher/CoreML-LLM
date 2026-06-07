@@ -33,23 +33,41 @@ let answer = try await llm.generate("What is the capital of France?")
 | **Qwen3.5 2B** | 2.8 GB | Text | **~27 tok/s** | [mlboydaisuke/qwen3.5-2B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-2B-CoreML) |
 | **Qwen3.5 0.8B** | 1.2 GB | Text | **~48 tok/s** | [mlboydaisuke/qwen3.5-0.8B-CoreML](https://huggingface.co/mlboydaisuke/qwen3.5-0.8B-CoreML) |
 | **Qwen3-VL 2B (stateful)** | 2.3 GB | Text + image | **~24 tok/s** | [mlboydaisuke/qwen3-vl-2b-stateful-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml) |
+| **Qwen3-VL 4B (stateful)** | 3.3 GB | Text + image | TBD (device) | [mlboydaisuke/qwen3-vl-4b-stateful-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-4b-stateful-coreml) |
+| **Qwen3-VL 8B (stateful)** | 5.9 GB | Text + image | TBD (device) | [mlboydaisuke/qwen3-vl-8b-stateful-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-8b-stateful-coreml) |
 | **LFM2.5 350M** [†](#lfm2-license) | 810 MB | Text | **52 tok/s** | [mlboydaisuke/lfm2.5-350m-coreml](https://huggingface.co/mlboydaisuke/lfm2.5-350m-coreml) |
 | **FunctionGemma-270M** | 850 MB | Function calling | (specialist) | [mlboydaisuke/functiongemma-270m-coreml](https://huggingface.co/mlboydaisuke/functiongemma-270m-coreml) |
 | **EmbeddingGemma-300M** | 295 MB | Sentence embeddings | (specialist) | [mlboydaisuke/embeddinggemma-300m-coreml](https://huggingface.co/mlboydaisuke/embeddinggemma-300m-coreml) |
 | Qwen3-VL 2B (legacy) | 2.9 GB | Text + image | ~7.5 tok/s | [mlboydaisuke/qwen3-vl-2b-coreml](https://huggingface.co/mlboydaisuke/qwen3-vl-2b-coreml) |
 | Qwen2.5 0.5B | 302 MB | Text | — | [mlboydaisuke/qwen2.5-0.5b-coreml](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
+| Granite 4.1 3B (preview, sideload, ANE) | 3.9 GB INT8+fp16 | Text | 14 tok/s Mac, iPhone TBD (top-1 parity 100% vs HF) | [ibm-granite/granite-4.1-3b](https://huggingface.co/ibm-granite/granite-4.1-3b) |
 
 All numbers are iPhone 17 Pro A19 Pro, 2048-token context, ANE-only (no GPU fallback at runtime unless noted). Methodology: [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 **Which one should I pick?**
 - Multimodal (image / video / audio) → **Gemma 4 E2B**
 - Image + text chat, lowest memory + fastest follow-up → **Qwen3-VL 2B (stateful)**
+- Image + text chat, higher quality → **Qwen3-VL 4B** (3.3 GB) or **8B** (5.9 GB, high-memory device)
 - Text-only, maximum quality under ≤3 GB → **Qwen3.5 2B**
 - Text-only, maximum quality → **Gemma 4 E4B**
 - Text-only, fast + chat-strong → **Qwen3.5 0.8B** (48 tok/s)
 - Text-only, smallest at high tok/s on iPhone → **LFM2.5 350M** (52 tok/s, 810 MB) [†](#lfm2-license)
 - Tool / function calling → **FunctionGemma-270M**
 - Sentence embeddings / RAG → **EmbeddingGemma-300M**
+
+## Burst tok/s is only half the story
+
+The decode numbers above are **cold-burst** speed. Run the same model *continuously* and the ranking inverts: the GPU runtimes (MLX, LiteRT-LM) thermally throttle **50%+ within ~60 s**, while CoreML on the ANE barely moves — it draws **~half the power** (12.7 W vs ~24.7 W at full decode, measured on Mac), so the phone doesn't have to throttle it. Under sustained load the ANE overtakes MLX outright.
+
+![Sustained decode throttling — iPhone 17 Pro, Gemma 4 E2B 4-bit](https://raw.githubusercontent.com/john-rocky/apple-silicon-llm-bench/main/results/iphone17pro-throttle.png)
+
+| Runtime (compute) | Burst tok/s | Sustained (10 min) | Retained |
+|---|--:|--:|--:|
+| **CoreML / ANE** | 33 | **22** | **67%** |
+| MLX / GPU | 48 | 18 | 38% |
+| LiteRT-LM / GPU | 56 | 27 | 48% |
+
+Lower peak, but it sustains — and leaves the GPU free for the rest of the app. Full data + repro: [apple-silicon-llm-bench](https://github.com/john-rocky/apple-silicon-llm-bench).
 
 ## Demos
 
@@ -165,6 +183,17 @@ pip install -r requirements.txt
 
 # Qwen2.5 0.5B (~2 min)
 python convert.py --model qwen2.5-0.5b --output ./output/qwen2.5-0.5b
+
+# IBM Granite 4.1 3B — dense GQA decoder (40 layers, hidden=2560), Apache 2.0.
+# Speedup-optimized chunked stateful path (Qwen3-VL Phase 1 / Qwen3.5 v1.8.0 recipe):
+# 5 INT8 chunks (8 layers each) + fp16 head + mmap embed sidecar, loaded via
+# Granite4Generator. Multipliers: embedding(×12) baked into embed_weight.bin,
+# logits(/10) baked into lm_head conv weight, attention(1/64) + residual(0.22)
+# live in the chunk graphs as scalar consts.
+python build_granite4_chunks.py \
+    --model-id ibm-granite/granite-4.1-3b \
+    --out-dir ./output/granite-4.1-3b \
+    --num-chunks 5 --nbits 8 --head-fp16
 
 # Gemma 4 — one-shot bundle builder (chunks + embeds + PLE + RoPE +
 # tokenizer + model_config.json, ready for USB sideload or HF upload)

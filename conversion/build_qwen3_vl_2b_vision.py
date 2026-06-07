@@ -41,13 +41,51 @@ from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed, Qwen3VLVisionBlock, Qwen3VLVisionPatchMerger,
-    Qwen3VLVisionRotaryEmbedding,
+    Qwen3VLVisionRotaryEmbedding, apply_rotary_pos_emb_vision,
 )
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 
 MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
+
+
+def _full_vision_attn_forward(self, hidden_states, cu_seqlens=None,
+                              rotary_pos_emb=None, position_embeddings=None,
+                              **kwargs):
+    """Single-image full attention — drop-in for Qwen3VLVisionAttention.forward.
+
+    The stock HF forward's non-flash path does
+    `torch.split(q/k/v, lengths.tolist(), dim=2)`, and `lengths.tolist()`
+    traces to an int op coremltools 9 can't convert (`only 0-dimensional
+    arrays can be converted to Python scalars`). For a single image
+    (cu_seqlens = [0, seq]) the split is a no-op, so full attention over
+    all patches is numerically identical and converts cleanly. Matches
+    the HF output layout: (1, num_heads, seq, hd) → (seq, num_heads*hd)."""
+    seq_length = hidden_states.shape[0]
+    q, k, v = (self.qkv(hidden_states)
+               .reshape(seq_length, 3, self.num_heads, -1)
+               .permute(1, 0, 2, 3).unbind(0))
+    # Inline RoPE with a static torch.chunk split instead of HF's
+    # rotate_half (`x[..., :x.shape[-1]//2]`) — the shape//2 slice traces
+    # to an aten::Int op coremltools rejects (see docs/ADDING_MODELS.md).
+    cos, sin = position_embeddings
+    cos = cos.unsqueeze(-2).float()
+    sin = sin.unsqueeze(-2).float()
+
+    def _rot(x):
+        x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    q = ((q.float() * cos) + (_rot(q) * sin)).to(v.dtype)
+    k = ((k.float() * cos) + (_rot(k) * sin)).to(v.dtype)
+    q = q.transpose(0, 1).unsqueeze(0)   # (1, num_heads, seq, head_dim)
+    k = k.transpose(0, 1).unsqueeze(0)
+    v = v.transpose(0, 1).unsqueeze(0)
+    attn_output = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+    attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
+    return self.proj(attn_output)
 # Input image resolution (square). 448 → 28×28 = 784 patches at
 # spatial=16. Low enough that the vision attention (seq=784) fits on
 # ANE, high enough to preserve useful detail. Matches Qwen3-VL's
@@ -94,6 +132,11 @@ class FixedGridVisionModel(nn.Module):
         self.pos_embed = hf_vision.pos_embed
         self.num_grid_per_side = hf_vision.num_grid_per_side
         self.blocks = hf_vision.blocks
+        # Swap each block's attention for the single-image full-attention
+        # variant so the trace has no cu_seqlens .tolist() int op.
+        import types
+        for blk in self.blocks:
+            blk.attn.forward = types.MethodType(_full_vision_attn_forward, blk.attn)
         self.merger = hf_vision.merger
         self.deepstack_merger_list = hf_vision.deepstack_merger_list
 
@@ -210,7 +253,10 @@ def main():
     args = ap.parse_args()
 
     out_root = Path(args.out_dir).resolve()
-    bundle_dir = out_root / "qwen3_vl_2b_vision"
+    # bundle dir derives from MODEL_ID so the thin 4B/8B forks
+    # (which only set MODEL_ID) land under qwen3_vl_{4b,8b}_vision/.
+    _size = "8b" if "8B" in MODEL_ID else ("4b" if "4B" in MODEL_ID else "2b")
+    bundle_dir = out_root / f"qwen3_vl_{_size}_vision"
     fp16_dir = out_root / "_fp16_intermediate"
     bundle_dir.mkdir(parents=True, exist_ok=True)
     fp16_dir.mkdir(parents=True, exist_ok=True)

@@ -92,6 +92,31 @@ public final class ModelDownloader: NSObject {
             downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
             folderName: "qwen2.5-0.5b")
 
+        /// IBM Granite 4.1 3B — dense GQA decoder (40 layers, hidden=2560,
+        /// 8 KV heads, vocab=100352, Apache 2.0). Shipped as 5 stateful
+        /// INT8 chunks × 8 layers each + fp16 head + mmap embed sidecar
+        /// (Qwen3-VL Phase 1 / Qwen3.5 v1.8.0 recipe). Granite scalar
+        /// multipliers are baked or graph-folded:
+        ///   * embedding_multiplier=12 ⇒ pre-multiplied into embed_weight.bin
+        ///   * logits_scaling=10       ⇒ pre-divided into chunk_head conv weight
+        ///   * attention_multiplier=1/64, residual_multiplier=0.22 live in
+        ///     each chunk's MIL graph as scalar consts.
+        /// Loaded via ``Granite4Generator`` (text-only chunked stateful
+        /// path, mirrors Qwen3-VL 2B stateful + Qwen3.5 v1.8.0 sampling).
+        ///
+        /// Sideload-only first ship: build with
+        ///   python conversion/build_granite4_chunks.py \
+        ///       --model-id ibm-granite/granite-4.1-3b \
+        ///       --out-dir ./output/granite-4.1-3b \
+        ///       --num-chunks 5 --nbits 8 --head-fp16
+        /// then push `output/granite-4.1-3b/{granite4_decode_chunks/,model_config.json,hf_model/}`
+        /// to `Documents/Models/granite-4.1-3b/` on device.
+        /// Bundle ≈ 3.0 GB (5 INT8 chunks ≈ 2.4 GB + fp16 head ≈ 510 MB).
+        public static let granite41_3b = ModelInfo(
+            id: "granite-4.1-3b", name: "Granite 4.1 3B (IBM, ANE)", size: "4.0 GB",
+            downloadURL: "",
+            folderName: "granite-4.1-3b")
+
         /// LFM2.5 350M — Liquid AI hybrid attention + short-conv decoder.
         /// 16 layers (6 attn + 10 conv), `hidden=1024`, `vocab=65536`. The
         /// conv block keeps a `(hidden, L_pad=3)` rolling window per
@@ -158,6 +183,29 @@ public final class ModelDownloader: NSObject {
             size: "2.3 GB",
             downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-2b-stateful-coreml/resolve/main",
             folderName: "qwen3-vl-2b-stateful")
+
+        /// Qwen3-VL 8B stateful (text-only) — MLState + slice_update KV,
+        /// 6-chunk INT4 (per-grouped-channel gs=64, matches the VLMKit
+        /// MLX `Qwen3-VL-8B-Instruct-4bit`) + fp16 embed sidecar.
+        /// 36 layers / hidden 4096 / untied head. ~5 GB. Sideload-only
+        /// under Documents/Models/qwen3-vl-8b-stateful/ via
+        /// scripts/qwen3vl8b_stateful_push.sh.
+        public static let qwen3vl_8b_stateful = ModelInfo(
+            id: "qwen3-vl-8b-stateful", name: "Qwen3-VL 8B (stateful)",
+            size: "5.0 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-8b-stateful-coreml/resolve/main",
+            folderName: "qwen3-vl-8b-stateful")
+
+        /// Qwen3-VL 4B stateful (text-only) — MLState + slice_update KV,
+        /// 6-chunk INT4 (per-grouped-channel gs=64) + fp16 embed sidecar.
+        /// 36 layers / hidden 2560 / TIED head. ~2.6 GB. Sideload-only
+        /// under Documents/Models/qwen3-vl-4b-stateful/ via
+        /// scripts/qwen3vl4b_stateful_push.sh.
+        public static let qwen3vl_4b_stateful = ModelInfo(
+            id: "qwen3-vl-4b-stateful", name: "Qwen3-VL 4B (stateful)",
+            size: "2.6 GB",
+            downloadURL: "https://huggingface.co/mlboydaisuke/qwen3-vl-4b-stateful-coreml/resolve/main",
+            folderName: "qwen3-vl-4b-stateful")
 
         /// Gemma 4 E4B — 42 layers, hidden=2560, 2 KV heads, text-only decoder.
         /// INT4 palettized, ctx=2048. Baseline ~14 tok/s on iPhone 17 Pro.
@@ -290,8 +338,9 @@ public final class ModelDownloader: NSObject {
                 gemma4e2b3way, gemma4e2b, gemma4e2bStatefulLinear,
                 gemma4e4b, gemma4e2bFashion,
                 qwen25_05b, qwen35_08b, qwen35_2b,
-                qwen3vl_2b, qwen3vl_2b_stateful,
+                qwen3vl_2b, qwen3vl_2b_stateful, qwen3vl_8b_stateful, qwen3vl_4b_stateful,
                 lfm2_5_350m,
+                granite41_3b,
             ]
             if experimental {
                 list.insert(gemma4e2bEagle3, at: 3)
@@ -434,6 +483,48 @@ public final class ModelDownloader: NSObject {
             return vl2bStatefulDir
         }
 
+        // Qwen3-VL 8B stateful (text-only): chunk_0..5 + chunk_head +
+        // embed_weight.bin under qwen3_vl_8b_stateful_chunks/. Sideloaded.
+        let vl8bStatefulDir = dir.appendingPathComponent("qwen3_vl_8b_stateful_chunks")
+        func vl8bStatefulChunkExists(_ base: String) -> Bool {
+            let pkgWeights = vl8bStatefulDir
+                .appendingPathComponent("\(base).mlpackage")
+                .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+            if fileManager.fileExists(atPath: pkgWeights.path) { return true }
+            let mlcWeights = vl8bStatefulDir
+                .appendingPathComponent("\(base).mlmodelc")
+                .appendingPathComponent("weights/weight.bin")
+            return fileManager.fileExists(atPath: mlcWeights.path)
+        }
+        let vl8bStatefulEmbed = vl8bStatefulDir.appendingPathComponent("embed_weight.bin")
+        if fileManager.fileExists(atPath: vl8bStatefulEmbed.path)
+            && vl8bStatefulChunkExists("chunk_0")
+            && vl8bStatefulChunkExists("chunk_1")
+            && vl8bStatefulChunkExists("chunk_head") {
+            return vl8bStatefulDir
+        }
+
+        // Qwen3-VL 4B stateful (text-only): chunk_0..5 + chunk_head +
+        // embed_weight.bin under qwen3_vl_4b_stateful_chunks/. Sideloaded.
+        let vl4bStatefulDir = dir.appendingPathComponent("qwen3_vl_4b_stateful_chunks")
+        func vl4bStatefulChunkExists(_ base: String) -> Bool {
+            let pkgWeights = vl4bStatefulDir
+                .appendingPathComponent("\(base).mlpackage")
+                .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+            if fileManager.fileExists(atPath: pkgWeights.path) { return true }
+            let mlcWeights = vl4bStatefulDir
+                .appendingPathComponent("\(base).mlmodelc")
+                .appendingPathComponent("weights/weight.bin")
+            return fileManager.fileExists(atPath: mlcWeights.path)
+        }
+        let vl4bStatefulEmbed = vl4bStatefulDir.appendingPathComponent("embed_weight.bin")
+        if fileManager.fileExists(atPath: vl4bStatefulEmbed.path)
+            && vl4bStatefulChunkExists("chunk_0")
+            && vl4bStatefulChunkExists("chunk_1")
+            && vl4bStatefulChunkExists("chunk_head") {
+            return vl4bStatefulDir
+        }
+
         // Gemma 4 E2B stateful (MLState + slice_update): chunk_{1..4} +
         // embed_tokens_q8.bin + RoPE tables + tokenizer under
         // gemma4_e2b_stateful_chunks/. Two folder names share this
@@ -487,6 +578,28 @@ public final class ModelDownloader: NSObject {
         if vl2bEmbedPresent && vl2bAll {
             return vl2bDir
         }
+        // Granite 4.1 chunked stateful: chunk_0..N + chunk_head +
+        // embed_weight.bin under granite4_decode_chunks/. Mirrors the
+        // Qwen3-VL Phase 1 layout. Default ship is 5 chunks (40 layers /
+        // 8 per chunk); detector accepts 2..8.
+        let g4Dir = dir.appendingPathComponent("granite4_decode_chunks")
+        func g4ChunkExists(_ base: String) -> Bool {
+            let pkgWeights = g4Dir
+                .appendingPathComponent("\(base).mlpackage")
+                .appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
+            if fileManager.fileExists(atPath: pkgWeights.path) { return true }
+            let mlcWeights = g4Dir
+                .appendingPathComponent("\(base).mlmodelc")
+                .appendingPathComponent("weights/weight.bin")
+            return fileManager.fileExists(atPath: mlcWeights.path)
+        }
+        let g4Embed = g4Dir.appendingPathComponent("embed_weight.bin")
+        if fileManager.fileExists(atPath: g4Embed.path)
+            && g4ChunkExists("chunk_head")
+            && g4ChunkExists("chunk_0") && g4ChunkExists("chunk_1") {
+            return g4Dir
+        }
+
         let chunk1 = dir.appendingPathComponent("chunk1.mlmodelc")
         if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
             if isChunkCtxMismatched(modelDir: dir, chunk1Dir: chunk1) {

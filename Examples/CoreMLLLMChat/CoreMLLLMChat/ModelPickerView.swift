@@ -93,6 +93,18 @@ struct ModelPickerView: View {
                     }
                 }
 
+                Section("Qwen3-VL 8B — text-only") {
+                    NavigationLink { Qwen3VL8BStatefulGeneratorView() } label: {
+                        Label("Stateful 64-token smoke test", systemImage: "bolt.fill")
+                    }
+                }
+
+                Section("Qwen3-VL 4B — text-only") {
+                    NavigationLink { Qwen3VL4BStatefulGeneratorView() } label: {
+                        Label("Stateful 64-token smoke test", systemImage: "bolt.fill")
+                    }
+                }
+
                 Section {
                     Toggle(isOn: Binding(
                         get: { UserDefaults.standard.object(

@@ -87,9 +87,12 @@ public final class Qwen3VL2BVisionEncoder {
     }
 
     /// Resolve `vision.mlmodelc` or `vision.mlpackage` under
-    /// `<folder>/qwen3_vl_2b_vision/` (compiling the package on demand).
-    public static func resolveModel(folder: URL) -> URL? {
-        let dir = folder.appendingPathComponent("qwen3_vl_2b_vision")
+    /// `<folder>/<subdir>/` (compiling the package on demand). The
+    /// encoder itself is size-agnostic (it passes runtime MLMultiArray
+    /// shapes), so 4B/8B reuse it by passing their own vision subdir.
+    public static func resolveModel(folder: URL,
+                                    subdir: String = "qwen3_vl_2b_vision") -> URL? {
+        let dir = folder.appendingPathComponent(subdir)
         let fm = FileManager.default
         let mlc = dir.appendingPathComponent("vision.mlmodelc")
         if fm.fileExists(atPath: mlc.path) { return mlc }

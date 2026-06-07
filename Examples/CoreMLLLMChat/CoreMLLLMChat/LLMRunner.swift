@@ -50,6 +50,26 @@ final class LLMRunner {
     // stays on the v1.4.0 generator, text goes through this one.
     private var qwen3vl2bStatefulGenerator: Qwen3VL2BStatefulGenerator?
 
+    // Qwen3-VL 8B stateful path (text-only): same MLState + slice_update
+    // generator as 2B, driven by Config.default8B (36 layers / 6 chunks,
+    // hidden 4096, untied head). Selected when
+    // `qwen3_vl_8b_stateful_chunks/` is present.
+    private var qwen3vl8bStatefulGenerator: Qwen3VL2BStatefulGenerator?
+
+    // Qwen3-VL 4B stateful path (text-only): same generator, driven by
+    // Config.default4B (36 layers / 6 chunks, hidden 2560, tied head).
+    // Selected when `qwen3_vl_4b_stateful_chunks/` is present.
+    private var qwen3vl4bStatefulGenerator: Qwen3VL2BStatefulGenerator?
+
+    // Granite 4.1 3B path (text-only, dense GQA + Granite multipliers).
+    // Selected when `granite4_decode_chunks/` is present in the model
+    // folder. Same MLState + slice_update + mmap embed sidecar recipe
+    // as Qwen3-VL stateful, plus the Qwen3.5 v1.8.0 full-vocab fp16
+    // logits → Swift fp32 argmax path. embed × 12 baked into
+    // embed_weight.bin and logits / 10 baked into chunk_head conv weight,
+    // so the runtime matches the Qwen3-family kernels.
+    private var granite4Generator: Granite4Generator?
+
     // Gemma 4 E2B stateful path: MLState + slice_update KV. Selected
     // when `gemma4_e2b_stateful_chunks/` is present. Independent of the
     // legacy ChunkedEngine path — runs through Gemma4StatefulEngine
@@ -90,7 +110,10 @@ final class LLMRunner {
         if llm != nil || qwen35Generator != nil || qwen35MLKVGenerator != nil
             || qwen3vl2bGenerator != nil
             || qwen3vl2bStatefulGenerator != nil
+            || qwen3vl8bStatefulGenerator != nil
+            || qwen3vl4bStatefulGenerator != nil
             || gemma4StatefulEngine != nil
+            || granite4Generator != nil
         {
             llm = nil
             qwen35Generator = nil
@@ -98,10 +121,13 @@ final class LLMRunner {
             qwen35Tokenizer = nil
             qwen3vl2bGenerator = nil
             qwen3vl2bStatefulGenerator = nil
+            qwen3vl8bStatefulGenerator = nil
+            qwen3vl4bStatefulGenerator = nil
             qwen3vl2bTokenizer = nil
             qwen3vl2bVisionEncoder = nil
             gemma4StatefulEngine = nil
             gemma4StatefulTokenizer = nil
+            granite4Generator = nil
             cachedVisionImage = nil
             cachedVisionFeatures = nil
             isLoaded = false
@@ -154,6 +180,65 @@ final class LLMRunner {
             }
         }
 
+        // Qwen3-VL 8B STATEFUL detection (text-only): chunk_0..5 +
+        // chunk_head + embed_weight.bin under qwen3_vl_8b_stateful_chunks/.
+        // Checked BEFORE the 2B detector: the 2B detector's bare-`base`
+        // fallback would otherwise greedily claim an 8B inner chunks dir.
+        // Here the bare-base case is gated on the folder name to stay
+        // unambiguous.
+        func stateful8bCandidates(_ base: URL) -> URL? {
+            var cands = [base.appendingPathComponent("qwen3_vl_8b_stateful_chunks")]
+            if base.lastPathComponent == "qwen3_vl_8b_stateful_chunks" {
+                cands.append(base)
+            }
+            for cand in cands {
+                let embed = cand.appendingPathComponent("embed_weight.bin")
+                let head = cand.appendingPathComponent("chunk_head.mlpackage")
+                let headC = cand.appendingPathComponent("chunk_head.mlmodelc")
+                let c0 = cand.appendingPathComponent("chunk_0.mlpackage")
+                let c0C = cand.appendingPathComponent("chunk_0.mlmodelc")
+                if fm.fileExists(atPath: embed.path)
+                    && (fm.fileExists(atPath: head.path) || fm.fileExists(atPath: headC.path))
+                    && (fm.fileExists(atPath: c0.path) || fm.fileExists(atPath: c0C.path))
+                {
+                    return cand
+                }
+            }
+            return nil
+        }
+        if let chunksRoot = stateful8bCandidates(folder) {
+            try await loadQwen3VL8BStateful(folder: chunksRoot.deletingLastPathComponent())
+            return
+        }
+
+        // Qwen3-VL 4B STATEFUL detection (text-only): chunk_0..5 +
+        // chunk_head + embed_weight.bin under qwen3_vl_4b_stateful_chunks/.
+        // Same bare-base name gate as the 8B detector.
+        func stateful4bCandidates(_ base: URL) -> URL? {
+            var cands = [base.appendingPathComponent("qwen3_vl_4b_stateful_chunks")]
+            if base.lastPathComponent == "qwen3_vl_4b_stateful_chunks" {
+                cands.append(base)
+            }
+            for cand in cands {
+                let embed = cand.appendingPathComponent("embed_weight.bin")
+                let head = cand.appendingPathComponent("chunk_head.mlpackage")
+                let headC = cand.appendingPathComponent("chunk_head.mlmodelc")
+                let c0 = cand.appendingPathComponent("chunk_0.mlpackage")
+                let c0C = cand.appendingPathComponent("chunk_0.mlmodelc")
+                if fm.fileExists(atPath: embed.path)
+                    && (fm.fileExists(atPath: head.path) || fm.fileExists(atPath: headC.path))
+                    && (fm.fileExists(atPath: c0.path) || fm.fileExists(atPath: c0C.path))
+                {
+                    return cand
+                }
+            }
+            return nil
+        }
+        if let chunksRoot = stateful4bCandidates(folder) {
+            try await loadQwen3VL4BStateful(folder: chunksRoot.deletingLastPathComponent())
+            return
+        }
+
         // Qwen3-VL 2B STATEFUL detection (Phase 1): chunk_0..N +
         // chunk_head + embed_weight.bin under qwen3_vl_2b_stateful_chunks/.
         // Tolerate both layouts depending on what `localModelURL`
@@ -184,6 +269,35 @@ final class LLMRunner {
             // resolveURLs expects the OUTER folder so it can append
             // its own subdir. Pass chunksRoot.deletingLastPathComponent().
             try await loadQwen3VL2BStateful(folder: chunksRoot.deletingLastPathComponent())
+            return
+        }
+
+        // Granite 4.1 3B STATEFUL detection: chunk_0..4 + chunk_head +
+        // embed_weight.bin under granite4_decode_chunks/. Same tolerant
+        // layout as Qwen3-VL stateful — accept either the outer model
+        // folder or the inner chunks dir, since `localModelURL` may
+        // return either depending on what got sideloaded.
+        func granite4Candidates(_ base: URL) -> URL? {
+            for cand in [
+                base.appendingPathComponent("granite4_decode_chunks"),
+                base,
+            ] {
+                let embed = cand.appendingPathComponent("embed_weight.bin")
+                let head = cand.appendingPathComponent("chunk_head.mlpackage")
+                let headC = cand.appendingPathComponent("chunk_head.mlmodelc")
+                let c0 = cand.appendingPathComponent("chunk_0.mlpackage")
+                let c0C = cand.appendingPathComponent("chunk_0.mlmodelc")
+                if fm.fileExists(atPath: embed.path)
+                    && (fm.fileExists(atPath: head.path) || fm.fileExists(atPath: headC.path))
+                    && (fm.fileExists(atPath: c0.path) || fm.fileExists(atPath: c0C.path))
+                {
+                    return cand
+                }
+            }
+            return nil
+        }
+        if let chunksRoot = granite4Candidates(folder) {
+            try await loadGranite4(folder: chunksRoot.deletingLastPathComponent())
             return
         }
 
@@ -297,6 +411,15 @@ final class LLMRunner {
             return try await generateQwen3VL2BStateful(
                 messages: messages, image: image)
         }
+        if qwen3vl8bStatefulGenerator != nil {
+            return try await generateQwen3VL8BStateful(messages: messages, image: image)
+        }
+        if qwen3vl4bStatefulGenerator != nil {
+            return try await generateQwen3VL4BStateful(messages: messages, image: image)
+        }
+        if granite4Generator != nil {
+            return try await generateGranite4(messages: messages)
+        }
         if gemma4StatefulEngine != nil {
             return try await generateGemma4Stateful(messages: messages)
         }
@@ -382,9 +505,15 @@ final class LLMRunner {
         // Qwen3-VL 2B stateful: drop the persisted KV cache + vision
         // feature cache so the next turn rebuilds from scratch.
         qwen3vl2bStatefulGenerator?.resetPersistedState()
+        qwen3vl8bStatefulGenerator?.resetPersistedState()
+        qwen3vl4bStatefulGenerator?.resetPersistedState()
         // Gemma 4 stateful: same pattern, drop the cross-turn KV state
         // (Phase 2a) so the next turn re-prefills from scratch.
         gemma4StatefulEngine?.resetPersistedState()
+        // Granite 4.1: state is recreated per `stream()` call (no
+        // persistedState yet), so resetConversation() is a no-op for
+        // the generator itself. Future commit can add cross-turn KV reuse
+        // (Qwen3-VL Phase 2 pattern) if 1st-token TTFT becomes a concern.
         cachedVisionImage = nil
         cachedVisionFeatures = nil
     }
@@ -1039,6 +1168,305 @@ final class LLMRunner {
         }
     }
 
+    // MARK: - Qwen3-VL 8B stateful dispatch (text-only)
+
+    private func loadQwen3VL8BStateful(folder: URL) async throws {
+        loadingStatus = "Loading Qwen3-VL tokenizer..."
+        let tok = try await AutoTokenizer.from(pretrained: "Qwen/Qwen3-VL-8B-Instruct")
+        loadingStatus = "Compiling Qwen3-VL 8B stateful chunks (first run only)..."
+        let gen = Qwen3VL2BStatefulGenerator(cfg: .default8B)
+        gen.modelFolderOverride = folder
+        try gen.load()
+        qwen3vl8bStatefulGenerator = gen
+        qwen3vl2bTokenizer = tok   // shared Qwen3-VL tokenizer slot
+
+        // Optional vision: chunk_0_vision (in the chunks dir) + the
+        // qwen3_vl_8b_vision encoder must both be present to enable image
+        // input. Otherwise fall back to text-only.
+        var visionTag = ""
+        if gen.hasVisionChunk,
+           let visionURL = Qwen3VL2BVisionEncoder.resolveModel(
+               folder: folder, subdir: "qwen3_vl_8b_vision") {
+            let enc = Qwen3VL2BVisionEncoder()
+            do {
+                try enc.load(modelURL: visionURL)
+                qwen3vl2bVisionEncoder = enc
+                visionTag = " + vision"
+            } catch {
+                print("[LLMRunner] 8B stateful vision encoder load failed: \(error)")
+            }
+        }
+        modelName = "Qwen3-VL 8B (stateful)\(visionTag)"
+        hasVision = qwen3vl2bVisionEncoder != nil && gen.hasVisionChunk
+        hasAudio = false
+
+        // ANE pre-warm: front-load each chunk's first-call compile so the
+        // first user send doesn't pay it.
+        loadingStatus = "Warming ANE..."
+        do {
+            let warmStart = Date()
+            try await gen.prewarm()
+            print("[LLMRunner] Qwen3-VL 8B stateful prewarm: "
+                  + "\(Int(Date().timeIntervalSince(warmStart) * 1000)) ms")
+        } catch {
+            print("[LLMRunner] Qwen3-VL 8B stateful prewarm failed: \(error)")
+        }
+
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] Qwen3-VL 8B stateful — \(gen.status)")
+    }
+
+    private func generateQwen3VL8BStateful(messages: [ChatMessage],
+                                            image: CGImage? = nil
+    ) async throws -> AsyncStream<String> {
+        guard let gen = qwen3vl8bStatefulGenerator,
+              let tok = qwen3vl2bTokenizer
+        else {
+            throw NSError(domain: "LLMRunner", code: 35,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3-VL 8B stateful not loaded"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        // Vision: encode image (cached by CGImage identity) + build the
+        // image-pad prompt. Mirrors the 2B path; the generator + encoder
+        // are size-agnostic.
+        var visionFeatures: Qwen3VL2BVisionFeatures? = nil
+        let inputIdsInt32: [Int32]
+        if let image, let encoder = qwen3vl2bVisionEncoder {
+            if let cachedImage = cachedVisionImage, cachedImage === image,
+               let cached = cachedVisionFeatures {
+                visionFeatures = cached
+            } else {
+                let f = try await encoder.encode(image)
+                cachedVisionImage = image
+                cachedVisionFeatures = f
+                visionFeatures = f
+            }
+            inputIdsInt32 = try buildQwen3VLVisionPromptIds(
+                tokenizer: tok, history: messages)
+        } else {
+            let chatMessages: [[String: Any]] = messages.compactMap { m in
+                let role: String
+                switch m.role {
+                case .user: role = "user"
+                case .assistant: role = "assistant"
+                case .system: return nil
+                }
+                return ["role": role, "content": m.content]
+            }
+            let ids: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
+                ?? tok.encode(text: messages.last?.content ?? "")
+            inputIdsInt32 = ids.map { Int32($0) }
+        }
+
+        let maxSeq = 2048
+        let remaining = maxSeq - inputIdsInt32.count - 1
+        if remaining < 1 {
+            throw NSError(domain: "LLMRunner", code: 36,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "prompt (\(inputIdsInt32.count) tokens) exceeds max_seq=\(maxSeq). "
+                    + "Clear chat or shorten."])
+        }
+        let maxNew = min(remaining, 1024)
+
+        var eosSet: Set<Int32> = [151643, 151644, 151645]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                var accumIds: [Int] = []
+                var emittedText = ""
+                var tokenCount = 0
+                var firstTokenAt: Date?
+                do {
+                    _ = try await gen.generate(
+                        inputIds: inputIdsInt32,
+                        maxNewTokens: maxNew,
+                        eosTokenIds: eosSet,
+                        visionFeatures: visionFeatures,
+                        onToken: { [weak self] tokenId in
+                            tokenCount += 1
+                            if eosSet.contains(tokenId) { return }
+                            accumIds.append(Int(tokenId))
+                            var current = tok.decode(tokens: accumIds)
+                            while current.last == "\u{FFFD}" {
+                                current.removeLast()
+                            }
+                            if current.count > emittedText.count,
+                               current.hasPrefix(emittedText) {
+                                let delta = String(current.dropFirst(emittedText.count))
+                                continuation.yield(delta)
+                                emittedText = current
+                            }
+                            if firstTokenAt == nil { firstTokenAt = Date() }
+                            if let start = firstTokenAt {
+                                let elapsed = Date().timeIntervalSince(start)
+                                let n = max(tokenCount - 1, 0)
+                                if elapsed > 0 && n > 0 {
+                                    Task { @MainActor in
+                                        self?.tokensPerSecond = Double(n) / elapsed
+                                    }
+                                }
+                            }
+                        })
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    // MARK: - Qwen3-VL 4B stateful dispatch (text-only)
+
+    private func loadQwen3VL4BStateful(folder: URL) async throws {
+        loadingStatus = "Loading Qwen3-VL tokenizer..."
+        let tok = try await AutoTokenizer.from(pretrained: "Qwen/Qwen3-VL-4B-Instruct")
+        loadingStatus = "Compiling Qwen3-VL 4B stateful chunks (first run only)..."
+        let gen = Qwen3VL2BStatefulGenerator(cfg: .default4B)
+        gen.modelFolderOverride = folder
+        try gen.load()
+        qwen3vl4bStatefulGenerator = gen
+        qwen3vl2bTokenizer = tok   // shared Qwen3-VL tokenizer slot
+
+        // Optional vision: chunk_0_vision + qwen3_vl_4b_vision encoder.
+        var visionTag = ""
+        if gen.hasVisionChunk,
+           let visionURL = Qwen3VL2BVisionEncoder.resolveModel(
+               folder: folder, subdir: "qwen3_vl_4b_vision") {
+            let enc = Qwen3VL2BVisionEncoder()
+            do {
+                try enc.load(modelURL: visionURL)
+                qwen3vl2bVisionEncoder = enc
+                visionTag = " + vision"
+            } catch {
+                print("[LLMRunner] 4B stateful vision encoder load failed: \(error)")
+            }
+        }
+        modelName = "Qwen3-VL 4B (stateful)\(visionTag)"
+        hasVision = qwen3vl2bVisionEncoder != nil && gen.hasVisionChunk
+        hasAudio = false
+
+        loadingStatus = "Warming ANE..."
+        do {
+            let warmStart = Date()
+            try await gen.prewarm()
+            print("[LLMRunner] Qwen3-VL 4B stateful prewarm: "
+                  + "\(Int(Date().timeIntervalSince(warmStart) * 1000)) ms")
+        } catch {
+            print("[LLMRunner] Qwen3-VL 4B stateful prewarm failed: \(error)")
+        }
+
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] Qwen3-VL 4B stateful — \(gen.status)")
+    }
+
+    private func generateQwen3VL4BStateful(messages: [ChatMessage],
+                                            image: CGImage? = nil
+    ) async throws -> AsyncStream<String> {
+        guard let gen = qwen3vl4bStatefulGenerator,
+              let tok = qwen3vl2bTokenizer
+        else {
+            throw NSError(domain: "LLMRunner", code: 37,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Qwen3-VL 4B stateful not loaded"])
+        }
+        isGenerating = true
+        tokensPerSecond = 0
+
+        var visionFeatures: Qwen3VL2BVisionFeatures? = nil
+        let inputIdsInt32: [Int32]
+        if let image, let encoder = qwen3vl2bVisionEncoder {
+            if let cachedImage = cachedVisionImage, cachedImage === image,
+               let cached = cachedVisionFeatures {
+                visionFeatures = cached
+            } else {
+                let f = try await encoder.encode(image)
+                cachedVisionImage = image
+                cachedVisionFeatures = f
+                visionFeatures = f
+            }
+            inputIdsInt32 = try buildQwen3VLVisionPromptIds(
+                tokenizer: tok, history: messages)
+        } else {
+            let chatMessages: [[String: Any]] = messages.compactMap { m in
+                let role: String
+                switch m.role {
+                case .user: role = "user"
+                case .assistant: role = "assistant"
+                case .system: return nil
+                }
+                return ["role": role, "content": m.content]
+            }
+            let ids: [Int] = (try? tok.applyChatTemplate(messages: chatMessages))
+                ?? tok.encode(text: messages.last?.content ?? "")
+            inputIdsInt32 = ids.map { Int32($0) }
+        }
+
+        let maxSeq = 2048
+        let remaining = maxSeq - inputIdsInt32.count - 1
+        if remaining < 1 {
+            throw NSError(domain: "LLMRunner", code: 38,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "prompt (\(inputIdsInt32.count) tokens) exceeds max_seq=\(maxSeq). "
+                    + "Clear chat or shorten."])
+        }
+        let maxNew = min(remaining, 1024)
+
+        var eosSet: Set<Int32> = [151643, 151644, 151645]
+        if let eid = tok.eosTokenId { eosSet.insert(Int32(eid)) }
+
+        return AsyncStream { continuation in
+            Task { [weak self] in
+                defer { Task { @MainActor in self?.isGenerating = false } }
+                var accumIds: [Int] = []
+                var emittedText = ""
+                var tokenCount = 0
+                var firstTokenAt: Date?
+                do {
+                    _ = try await gen.generate(
+                        inputIds: inputIdsInt32,
+                        maxNewTokens: maxNew,
+                        eosTokenIds: eosSet,
+                        visionFeatures: visionFeatures,
+                        onToken: { [weak self] tokenId in
+                            tokenCount += 1
+                            if eosSet.contains(tokenId) { return }
+                            accumIds.append(Int(tokenId))
+                            var current = tok.decode(tokens: accumIds)
+                            while current.last == "\u{FFFD}" {
+                                current.removeLast()
+                            }
+                            if current.count > emittedText.count,
+                               current.hasPrefix(emittedText) {
+                                let delta = String(current.dropFirst(emittedText.count))
+                                continuation.yield(delta)
+                                emittedText = current
+                            }
+                            if firstTokenAt == nil { firstTokenAt = Date() }
+                            if let start = firstTokenAt {
+                                let elapsed = Date().timeIntervalSince(start)
+                                let n = max(tokenCount - 1, 0)
+                                if elapsed > 0 && n > 0 {
+                                    Task { @MainActor in
+                                        self?.tokensPerSecond = Double(n) / elapsed
+                                    }
+                                }
+                            }
+                        })
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                continuation.finish()
+            }
+        }
+    }
+
     // MARK: - Gemma 4 stateful (text-only)
 
     private func loadGemma4Stateful(folder: URL) async throws {
@@ -1343,6 +1771,26 @@ final class LLMRunner {
         if let u = findModel(in: folder, name: "vision") {
             entries.append(Entry(label: "vision", url: u, cfg: visionCfg))
         }
+
+        // Granite 4.1 stateful chunks live under granite4_decode_chunks/
+        // with the chunk_0..N + chunk_head naming. findModel only walks
+        // the outer folder, so resolve the inner subdir manually.
+        let g4 = folder.appendingPathComponent("granite4_decode_chunks")
+        let fm = FileManager.default
+        if fm.fileExists(atPath: g4.path) {
+            for name in ["chunk_0", "chunk_1", "chunk_2", "chunk_3",
+                          "chunk_4", "chunk_head"] {
+                let mlc = g4.appendingPathComponent("\(name).mlmodelc")
+                let pkg = g4.appendingPathComponent("\(name).mlpackage")
+                let url: URL? =
+                    fm.fileExists(atPath: mlc.path) ? mlc :
+                    fm.fileExists(atPath: pkg.path) ? pkg : nil
+                if let url = url {
+                    entries.append(Entry(label: name, url: url, cfg: cfg))
+                }
+            }
+        }
+
         if entries.isEmpty { return "No chunks found." }
 
         var lines: [String] = ["MLComputePlan placement:"]
@@ -1410,6 +1858,83 @@ final class LLMRunner {
     }
 
     @available(iOS 17.0, macOS 14.0, *)
+    // MARK: - Granite 4.1 3B dispatch
+
+    private func loadGranite4(folder: URL) async throws {
+        loadingStatus = "Loading Granite 4.1 3B chunks..."
+        let gen = Granite4Generator(modelDirectory: folder, cfg: .granite4_3b)
+        try await gen.load { [weak self] s in
+            Task { @MainActor in self?.loadingStatus = s }
+        }
+        granite4Generator = gen
+        modelName = "Granite 4.1 3B (IBM, ANE)"
+        hasVision = false
+        hasAudio = false
+
+        // Prewarm: front-load each chunk + head's first-call ANE compile
+        // (~1-3s per chunk on iPhone 17 Pro A19) so the user's first
+        // chat doesn't average compile time into its visible tok/s.
+        loadingStatus = "Warming ANE..."
+        let warmStart = Date()
+        do {
+            try await gen.prewarm()
+            let warmMs = Int(Date().timeIntervalSince(warmStart) * 1000)
+            print("[LLMRunner] Granite 4.1 prewarm: \(warmMs) ms")
+        } catch {
+            print("[LLMRunner] Granite 4.1 prewarm failed: \(error)")
+        }
+
+        isLoaded = true
+        loadingStatus = "Ready"
+        print("[LLMRunner] Granite 4.1 3B — \(gen.status)")
+    }
+
+    private func generateGranite4(messages: [ChatMessage]) async throws
+        -> AsyncStream<String>
+    {
+        guard let gen = granite4Generator else {
+            throw NSError(domain: "LLMRunner", code: 41,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Granite 4.1 3B not loaded"])
+        }
+        // Granite chat template (chat_template.jinja in hf_model/) reads
+        // role/content; system messages are accepted but our chat UI only
+        // emits user/assistant. Pass-through to the generator's stream.
+        let dictMessages: [[String: String]] = messages.compactMap { m in
+            switch m.role {
+            case .user:      return ["role": "user",      "content": m.content]
+            case .assistant: return ["role": "assistant", "content": m.content]
+            case .system:    return ["role": "system",    "content": m.content]
+            }
+        }
+        var opts = Granite4Generator.SamplingOptions()
+        // Allow up to context-1 new tokens; Granite4Generator stops at
+        // maxSeq anyway, and 256 was unnecessarily short for chat.
+        opts.maxNewTokens = 1800
+        opts.temperature = 0.0
+        opts.repetitionPenalty = 1.1
+
+        isGenerating = true
+        tokensPerSecond = 0
+        let runner = self
+        let upstream = try await gen.stream(messages: dictMessages, options: opts)
+        return AsyncStream { continuation in
+            Task { @MainActor in
+                defer { runner.isGenerating = false }
+                do {
+                    for try await tok in upstream {
+                        continuation.yield(tok)
+                        runner.tokensPerSecond = gen.lastTokensPerSecond
+                    }
+                } catch {
+                    continuation.yield("[Error: \(error.localizedDescription)]")
+                }
+                runner.loadingStatus = "Ready"
+                continuation.finish()
+            }
+        }
+    }
+
     private func countOps(plan: MLComputePlan) -> (total: Int, ane: Int, gpu: Int, cpu: Int) {
         // Multi-function chunks (build_verify_chunks.py output) name their
         // entry points "decode_q1" / "verify_qK", not "main". Fall through to
