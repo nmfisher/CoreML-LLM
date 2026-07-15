@@ -483,6 +483,51 @@ final class ChunkedEngine {
             let origin = (deferEnv == "1") ? "env=1" : "default"
             print("[Load] deferred prefill load (\(origin)) — decode chunks foreground, prefill chunks background")
         }
+        // Per-chunk compute-unit override. Normally every decode chunk shares
+        // `effectiveUnits`, but a specific chunk can be pinned to one device
+        // via LLM_CHUNK_COMPUTE_<NAME>=cpu|cpugpu|cpuane|all (NAME = the chunk
+        // file name, e.g. chunk3_3way). Motivation: a chunk whose MIL program
+        // has a mixed ANE/resident split that CoreML refuses to partition
+        // (error -1, "Unable to compute the prediction") runs fine when forced
+        // to a uniform device here while the other chunks stay on ANE.
+        // NOTE: named `resolveUnits`, not `computeUnits`, to avoid colliding
+        // with the `computeUnits` parameter (line ~285) — a same-named nested
+        // func breaks Swift member resolution in its own body.
+        func resolveUnits(forChunk name: String) -> MLComputeUnits {
+            // Case-insensitive key lookup: `environment` is case-sensitive, but
+            // the override is keyed by an uppercase-by-convention env var name
+            // (LLM_CHUNK_COMPUTE_<name>), so compare lowercased keys. Only the
+            // *value* match is case-insensitive (handled below).
+            let want = "LLM_CHUNK_COMPUTE_\(name)".lowercased()
+            // `environment` is case-sensitive, so walk the keys and compare
+            // lowercased — users conventionally type the var name uppercase.
+            guard let raw = ProcessInfo.processInfo.environment.first { key, _ in
+                key.lowercased() == want
+            }?.value else {
+                return effectiveUnits
+            }
+            let units: MLComputeUnits
+            // Value match is case-insensitive ("CPU", "cpu", "Cpu" all work).
+            switch raw.lowercased() {
+            case "cpu", "cpuonly": units = .cpuOnly
+            case "cpugpu", "cpuandgpu": units = .cpuAndGPU
+            case "cpuane", "cpuandneuralengine": units = .cpuAndNeuralEngine
+            case "all": units = .all
+            default: return effectiveUnits
+            }
+            print("[Load] \(name): per-chunk computeUnits=\(raw) → \(units)")
+            return units
+        }
+        // Build a fresh decode-chunk config: per-chunk unit override (if any),
+        // plus the shared .fastPrediction hint. Isolated so the 4- and 3-chunk
+        // paths construct configs consistently.
+        func makeDecodeConfig(forChunk name: String) -> MLModelConfiguration {
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = resolveUnits(forChunk: name)
+            applyHints(cfg)
+            return cfg
+        }
+
         // Chunk file names depend on decode mode.
         //   4-chunk: chunk1 + chunk2 + chunk3 + chunk4
         //   3-chunk Topology II: chunk1 + chunk2_3way + chunk3_3way (chunk3 absent)
@@ -501,13 +546,13 @@ final class ChunkedEngine {
             c4Name = "chunk4"
         }
         var chunkWork: [(String, MLModelConfiguration)] = [
-            (c1Name, mlConfig),
-            (c2Name, mlConfig),
+            (c1Name, makeDecodeConfig(forChunk: c1Name)),
+            (c2Name, makeDecodeConfig(forChunk: c2Name)),
         ]
         if !is3Chunk {
-            chunkWork.append(("chunk3", mlConfig))
+            chunkWork.append(("chunk3", makeDecodeConfig(forChunk: "chunk3")))
         }
-        chunkWork.append((c4Name, mlConfig))
+        chunkWork.append((c4Name, makeDecodeConfig(forChunk: c4Name)))
         if hasPrefillFiles && !deferPrefill {
             for name in ["prefill_chunk1", "prefill_chunk2",
                          "prefill_chunk3", "prefill_chunk4"] {

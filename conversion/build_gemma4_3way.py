@@ -85,6 +85,7 @@ def _convert_and_palettize(model, sample, inputs, outputs, *, label: str, quanti
         minimum_deployment_target=ct.target.iOS18,
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
+        skip_model_load=True,
     )
     print(f"    converted in {time.time()-t:.1f}s")
 

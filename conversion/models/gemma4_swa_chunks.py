@@ -38,7 +38,13 @@ from .gemma4 import Gemma4Model
 
 
 def v_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    mean_sq = x.pow(2).mean(-1, keepdim=True) + eps
+    # x.pow(2) converts to ios18.pow, which has no working ANE kernel on the
+    # M2 Pro and blocks the whole graph from the ANE: the only 8 unknown ops
+    # in chunk1's MLComputePlan audit were ios18.pow, all from this function.
+    # x * x stays an elementwise mul (ANE-native, like the graph's other mul/
+    # reduce_mean/rsqrt ops), preserves the exact RMSNorm math, and traces
+    # cleanly where a layer_norm cat-trick's normalized_shape would not.
+    mean_sq = (x * x).mean(-1, keepdim=True) + eps
     return x * torch.rsqrt(mean_sq)
 
 

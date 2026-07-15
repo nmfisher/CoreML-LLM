@@ -16,6 +16,7 @@ let package = Package(
         .executable(name: "determinism-oracle", targets: ["DeterminismOracle"]),
         .executable(name: "verify-k8-probe", targets: ["VerifyK8Probe"]),
         .executable(name: "ane-residency-gate", targets: ["AneResidencyGate"]),
+        .executable(name: "chunk-probe", targets: ["ChunkProbe"]),
         .executable(name: "gemma4mm-smoke", targets: ["Gemma4MMSmoke"]),
         // Standalone samples for the two Gemma-3-based models. These live in
         // the same package on purpose — a LocalAIKit-style wrapper can depend
@@ -126,6 +127,17 @@ let package = Package(
             name: "AneResidencyGate",
             dependencies: ["CoreMLLLM"],
             path: "Sources/ane-residency-gate",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // Single-chunk ANE-acceptance probe: loads one compiled .mlmodelc
+        // with a chosen compute unit, feeds zero-valued inputs shaped to the
+        // model spec, and predicts. Faithfully reproduces the Swift runtime
+        // error -1 (unlike coremltools predict, which silently falls back to
+        // CPU). Used to bisect the chunk2_3way size cliff on isolated partials.
+        .executableTarget(
+            name: "ChunkProbe",
+            dependencies: [],
+            path: "Sources/chunk-probe",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
